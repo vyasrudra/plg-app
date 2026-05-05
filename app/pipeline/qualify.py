@@ -36,12 +36,7 @@ GEO_MIX_MIN = 10  # At least 10 geo-matched leads
 QUALIFICATION_BATCH_SIZE = 25
 MAX_EMPLOYEE_COUNT = 20
 
-# Industries that indicate the company IS a marketing/ad agency
-AGENCY_KEYWORDS = [
-    "marketing", "advertising", "ad agency", "media agency",
-    "digital agency", "creative agency", "branding agency",
-    "pr agency", "public relations", "media buying",
-]
+
 
 
 class QualificationPipeline:
@@ -423,22 +418,11 @@ class QualificationPipeline:
             if lead.employees is not None and lead.employees >= MAX_EMPLOYEE_COUNT:
                 continue
 
-            # Drop if it's a marketing/advertising agency
-            if self._is_agency(lead):
-                continue
-
             filtered.append(lead)
 
         return filtered
 
-    def _is_agency(self, lead: QualifiedLead) -> bool:
-        """Check if a lead is itself a marketing/advertising agency."""
-        check_text = " ".join([
-            lead.company or "",
-            lead.industry or "",
-            lead.why_qualified or "",
-        ]).lower()
-        return any(kw in check_text for kw in AGENCY_KEYWORDS)
+
 
     # ─── Step 6: Geographic Mix ────────────────────────────────
 
