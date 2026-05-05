@@ -20,7 +20,7 @@ from app.services.scraper import WebsiteScraper
 from app.services.openrouter import OpenRouterClient
 from app.services.leadmagic import LeadMagicClient
 from app.services.sheets import GoogleSheetsClient
-from app.services.geography import is_same_or_adjacent, normalize_state
+from app.services.geography import normalize_state
 from app.pipeline.prompts import (
     ICP_EXTRACTION_PROMPT,
     LEAD_QUALIFICATION_PROMPT,
@@ -31,8 +31,6 @@ logger = structlog.get_logger()
 # ─── Constants ─────────────────────────────────────────────────
 
 TARGET_LEADS = 50
-GEO_MIX_PERCENT = 0.20  # 20% from same/adjacent state
-GEO_MIX_MIN = 10  # At least 10 geo-matched leads
 QUALIFICATION_BATCH_SIZE = 25
 
 
@@ -89,14 +87,13 @@ class QualificationPipeline:
         scored = await self._qualify_candidates(candidates, icp)
         logger.info("qualification_done", scored=len(scored))
 
-        # ── Step 5: Apply exclusions ───────────────────────────
+        # ── Step 5: Final filtering and exclusions ───────────────
         logger.info("pipeline_step", step="5_exclusions")
-        filtered = self._apply_exclusions(scored)
-        logger.info("after_exclusions", remaining=len(filtered))
-
-        # ── Step 6: Geographic mix enforcement ─────────────────
-        logger.info("pipeline_step", step="6_geo_mix", target_state=target_state)
-        final_leads = self._enforce_geo_mix(filtered, target_state)
+        leads = self._apply_exclusions(scored)
+        
+        # Sort by relevance and take top 50
+        leads.sort(key=lambda x: x.relevance_score, reverse=True)
+        final_leads = leads[:50]
         logger.info("final_leads", count=len(final_leads))
 
         # ── Step 7: Write to Google Sheets ─────────────────────
@@ -158,52 +155,40 @@ class QualificationPipeline:
         target_state: Optional[str],
     ) -> list[CandidateCompany]:
         """
-        Build candidate pool by using AI to generate seed domains in the target industry,
-        then using LeadMagic competitors_search to expand those seeds.
+        Build candidate pool by using AI to generate 100 targeted domains
+        based on the ICP, niche, and past clients/case studies.
         """
         all_candidates: dict[str, CandidateCompany] = {}
 
-        # 1. Use past clients / case studies from ICP to find similar companies
-        seed_domains = icp.past_clients
-        if not seed_domains:
-            # Fallback if Claude couldn't extract any
-            seed_domains = ["ecommerce.com", "saas.com"]
-            
-        # Clean domains
-        seed_domains = [d for d in seed_domains if "." in d]
+        # 1. Ask AI to generate 100 highly targeted domains matching the ICP/Niche/Past Clients
+        seed_prompt = f"""You need to provide a massive list of 100 real, active US company domains that would be PERFECT leads for this agency.
+        Agency Niche: {icp.niche}
+        Services they provide: {', '.join(icp.services_provided)}
+        Examples of their past clients (or similar): {', '.join(icp.past_clients)}
+        
+        Output ONLY a JSON array of strings (the domains like "example.com"). No prose.
+        Ensure these are SMBs (Small-to-Medium Businesses) and NOT massive corporations."""
+        
+        try:
+            raw_seeds = await self.ai.call_claude(seed_prompt, temperature=0.7)
+            seed_domains = await self.ai.parse_json_response(raw_seeds)
+            if not isinstance(seed_domains, list):
+                seed_domains = []
+        except Exception:
+            seed_domains = []
 
-        # 2. Get competitors for those seed domains to find companies like their clients
-        tasks = [self._get_competitors_of(domain) for domain in seed_domains[:10]]
-        first_degree = []
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in results:
-                if isinstance(res, list):
-                    first_degree.extend(res)
-
-        # Expand pool by getting competitors of the first degree as well
-        expanded_domains = [c.domain for c in first_degree if c.domain][:15]
-        tasks2 = [self._get_competitors_of(domain) for domain in expanded_domains]
-        if tasks2:
-            results2 = await asyncio.gather(*tasks2, return_exceptions=True)
-            for res in results2:
-                if isinstance(res, list):
-                    first_degree.extend(res)
-
-        # Add to all candidates
-        for c in first_degree:
-            key = (c.domain or c.company_name).lower()
-            if key not in all_candidates and c.company_name.lower() != company_name.lower():
-                all_candidates[key] = c
-
-        # 3. Enrich candidates to get employee counts
-        enrich_tasks = [self._enrich_candidate(c) for c in all_candidates.values()]
+        # 2. Enrich the seeds directly via LeadMagic company_search
+        candidates = [CandidateCompany(company_name=domain.split('.')[0], domain=domain) for domain in seed_domains if isinstance(domain, str)]
+        
+        # Process in batches to avoid overwhelming the concurrent limits
+        enrich_tasks = [self._enrich_candidate(c) for c in candidates[:100]]
         if enrich_tasks:
             enriched_results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
             for res in enriched_results:
                 if isinstance(res, CandidateCompany):
                     key = (res.domain or res.company_name).lower()
-                    all_candidates[key] = res
+                    if key not in all_candidates and res.company_name.lower() != company_name.lower():
+                        all_candidates[key] = res
 
         # Filter: US-based only, and < 50 employees
         filtered = []
@@ -402,47 +387,7 @@ class QualificationPipeline:
 
     # ─── Step 6: Geographic Mix ────────────────────────────────
 
-    def _enforce_geo_mix(
-        self,
-        leads: list[QualifiedLead],
-        target_state: Optional[str],
-    ) -> list[QualifiedLead]:
-        """
-        Ensure at least 20% (10 of 50) are from target's state or adjacent.
-        PRD Section 6, Step 4.
-        """
-        if not target_state or not leads:
-            return leads[:TARGET_LEADS]
 
-        geo_matched = []
-        non_geo = []
-
-        for lead in leads:
-            if is_same_or_adjacent(lead.state, target_state):
-                geo_matched.append(lead)
-            else:
-                non_geo.append(lead)
-
-        # Build final list ensuring geo mix
-        final = []
-
-        # First, add geo-matched leads (up to the minimum required)
-        geo_needed = GEO_MIX_MIN
-        final.extend(geo_matched[:geo_needed])
-
-        # Fill remaining slots from non-geo, sorted by score
-        remaining_slots = TARGET_LEADS - len(final)
-        remaining_geo = geo_matched[geo_needed:]
-
-        # Merge remaining geo + non-geo, sort by score, take remaining
-        pool = remaining_geo + non_geo
-        pool.sort(key=lambda x: x.relevance_score, reverse=True)
-        final.extend(pool[:remaining_slots])
-
-        # Re-sort final list by relevance score
-        final.sort(key=lambda x: x.relevance_score, reverse=True)
-
-        return final[:TARGET_LEADS]
 
     # ─── Helpers ───────────────────────────────────────────────
 
