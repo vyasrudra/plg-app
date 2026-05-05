@@ -99,7 +99,7 @@ Output strict JSON:
 {{
   "services_provided": ["service 1", "service 2"],
   "niche": "1 sentence describing exactly what they do and for whom",
-  "past_clients": ["client1.com", "client2.com"] (if you can find domains or names of case studies/clients. If none found, infer 3 example domains of perfect ideal clients they WOULD serve.)
+  "past_clients": ["client1.com", "client2.com"] (if you can find domains or names of case studies/clients. If none found, infer 10 example domains of perfect ideal clients they WOULD serve.)
 }}
 
 No prose, no markdown fences. Just the raw JSON object."""
