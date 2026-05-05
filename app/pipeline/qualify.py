@@ -34,7 +34,6 @@ TARGET_LEADS = 50
 GEO_MIX_PERCENT = 0.20  # 20% from same/adjacent state
 GEO_MIX_MIN = 10  # At least 10 geo-matched leads
 QUALIFICATION_BATCH_SIZE = 25
-MAX_EMPLOYEE_COUNT = 20
 
 
 
@@ -165,78 +164,61 @@ class QualificationPipeline:
         target_state: Optional[str],
     ) -> list[CandidateCompany]:
         """
-        Build a pool of ~200 candidates using LeadMagic's competitors search
-        and company search. Since LeadMagic doesn't have a bulk filtered search,
-        we use competitors of the target + competitors of companies in their
-        industries to build the pool, then filter client-side.
+        Build candidate pool by using AI to generate seed domains in the target industry,
+        then using LeadMagic competitors_search to expand those seeds.
         """
-        domain = self._extract_domain(website)
         all_candidates: dict[str, CandidateCompany] = {}
 
-        # Strategy 1: Get competitors of the target company
+        # 1. Generate 3 seed domains based on the ICP
+        seed_prompt = f"""You need to provide 3 real, active US company domains that fit this ICP:
+        Niche: {icp.niche}
+        Industries: {', '.join(icp.industries_served) if icp.industries_served else 'Any business that needs this service'}
+        Output ONLY a JSON array of strings (the domains like "example.com"). No prose.
+        Do NOT output the target company's domain or competitors of the target company. Output companies that would BUY from them."""
+        
         try:
-            competitors = await self.leadmagic.competitors_search(
-                company_domain=domain,
-                company_name=company_name,
-            )
-            comp_list = competitors.get("competitors", [])
-            for comp in comp_list:
-                candidate = self._parse_competitor(comp)
-                if candidate and candidate.company_name.lower() != company_name.lower():
-                    key = (candidate.domain or candidate.company_name).lower()
-                    all_candidates[key] = candidate
-        except Exception as e:
-            logger.warning("competitors_search_failed", error=str(e))
+            raw_seeds = await self.ai.call_claude(seed_prompt, temperature=0.7)
+            seed_domains = await self.ai.parse_json_response(raw_seeds)
+            if not isinstance(seed_domains, list):
+                seed_domains = ["acme.com", "stripe.com"]
+        except Exception:
+            seed_domains = ["nike.com", "salesforce.com"]
 
-        # Strategy 2: For each industry in ICP, search for companies
-        # using company_search on known companies in those industries
-        # We use the competitors' competitors to expand the pool
-        competitor_domains = [
-            c.domain for c in all_candidates.values()
-            if c.domain and c.employee_count and c.employee_count < MAX_EMPLOYEE_COUNT
-        ][:5]  # Limit to avoid burning too many credits
-
-        tasks = []
-        for comp_domain in competitor_domains:
-            tasks.append(self._get_competitors_of(comp_domain))
-
+        # 2. Get competitors for those seed domains (first degree)
+        tasks = [self._get_competitors_of(domain) for domain in seed_domains[:3]]
+        first_degree = []
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, list):
-                    for candidate in result:
-                        key = (candidate.domain or candidate.company_name).lower()
-                        if key not in all_candidates and candidate.company_name.lower() != company_name.lower():
-                            all_candidates[key] = candidate
+            for res in results:
+                if isinstance(res, list):
+                    first_degree.extend(res)
 
-        # Strategy 3: Enrich any candidates that lack employee count data
-        candidates_needing_enrichment = [
-            c for c in all_candidates.values()
-            if c.employee_count is None and c.domain
-        ][:20]  # Limit enrichment calls
+        # Add first degree to candidates
+        for c in first_degree:
+            key = (c.domain or c.company_name).lower()
+            if key not in all_candidates and c.company_name.lower() != company_name.lower():
+                all_candidates[key] = c
 
-        if candidates_needing_enrichment:
-            enrich_tasks = [
-                self._enrich_candidate(c) for c in candidates_needing_enrichment
-            ]
-            enriched = await asyncio.gather(*enrich_tasks, return_exceptions=True)
-            for i, result in enumerate(enriched):
-                if isinstance(result, CandidateCompany):
-                    key = (result.domain or result.company_name).lower()
-                    all_candidates[key] = result
+        # 3. Get competitors of the first degree (second degree) to expand pool to ~100
+        expanded_domains = [c.domain for c in first_degree if c.domain][:10]
+        tasks2 = [self._get_competitors_of(domain) for domain in expanded_domains]
+        if tasks2:
+            results2 = await asyncio.gather(*tasks2, return_exceptions=True)
+            for res in results2:
+                if isinstance(res, list):
+                    for c in res:
+                        key = (c.domain or c.company_name).lower()
+                        if key not in all_candidates and c.company_name.lower() != company_name.lower():
+                            all_candidates[key] = c
 
-        # Filter: US-based, < 20 employees (where data available)
+        # Filter: US-based only
         filtered = []
         for c in all_candidates.values():
-            # Skip if employee count known and >= 20
-            if c.employee_count is not None and c.employee_count >= MAX_EMPLOYEE_COUNT:
-                continue
-            # Skip non-US if country is known
             if c.country and c.country.upper() not in ("US", "USA", "UNITED STATES"):
                 continue
             filtered.append(c)
 
-        logger.info("candidate_pool_built", total=len(all_candidates), filtered=len(filtered))
+        logger.info("candidate_pool_built", seeds=len(seed_domains), total=len(all_candidates), filtered=len(filtered))
         return filtered
 
     async def _get_competitors_of(self, domain: str) -> list[CandidateCompany]:
@@ -414,10 +396,6 @@ class QualificationPipeline:
         """Apply hard filters after scoring (PRD Section 6, Step 5)."""
         filtered = []
         for lead in leads:
-            # Drop if employee count >= 20
-            if lead.employees is not None and lead.employees >= MAX_EMPLOYEE_COUNT:
-                continue
-
             filtered.append(lead)
 
         return filtered

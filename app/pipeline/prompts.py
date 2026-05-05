@@ -23,9 +23,8 @@ QUALIFICATION RULES:
    - No in-house marketing team OR a marketing team of 1–2 people
    - Unsophisticated current marketing (basic website, low LinkedIn presence)
 3. Score LOWER (or zero) for:
-   - Companies with >20 employees (drop entirely)
+   - Companies with >20 employees
    - Established household-name brands
-   - Companies that are themselves marketing/advertising agencies
    - Public companies or any with apparent revenue >$50M
    - Companies with a large in-house marketing team
 
