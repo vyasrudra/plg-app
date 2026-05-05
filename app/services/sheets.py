@@ -1,7 +1,7 @@
 """
 PLG App — Google Sheets service.
-Creates sheets, writes rows, sets public read access.
-Uses a service account — no OAuth flow.
+Adds a new tab to a shared template spreadsheet for each lead list.
+Uses a service account — no OAuth flow, no file creation (avoids SA quota limits).
 """
 
 import base64
@@ -38,9 +38,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# Template spreadsheet ID — lives in the shared folder, owned by the user
+TEMPLATE_SHEET_ID = "1GkzADhz5Mx6CzhEOHl0Yhc90AukFFG0OtYabQNuq_e8"
+
 
 class GoogleSheetsClient:
-    """Google Sheets + Drive client for creating and sharing lead sheets."""
+    """Google Sheets client that writes lead lists as new tabs in a shared template."""
 
     def __init__(self):
         settings = get_settings()
@@ -52,7 +55,6 @@ class GoogleSheetsClient:
             decoded = base64.b64decode(creds_json)
             creds_info = json.loads(decoded)
         except Exception:
-            # Try as raw JSON string
             creds_info = json.loads(creds_json)
 
         credentials = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
@@ -61,45 +63,36 @@ class GoogleSheetsClient:
 
     def create_sheet(self, target_company: str, leads: list[QualifiedLead]) -> str:
         """
-        Create a new Google Sheet with qualified leads.
-        Returns the public URL.
+        Create a new tab in the template spreadsheet with qualified leads.
+        Returns a direct URL to the new tab.
+
+        This avoids creating new Drive files (SA has 0 quota).
+        Each lead list becomes a separate tab in the shared template.
         """
-        title = f"Leads for {target_company} — {datetime.now().strftime('%Y-%m-%d')}"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        tab_name = f"{target_company[:30]} — {timestamp}"
 
         start = time.perf_counter()
 
-        # 1. Create the spreadsheet
-        spreadsheet_body = {
-            "properties": {"title": title},
-            "sheets": [{"properties": {"title": "Qualified Leads"}}],
-        }
-        spreadsheet = (
-            self.sheets_service.spreadsheets()
-            .create(body=spreadsheet_body)
-            .execute()
-        )
-        spreadsheet_id = spreadsheet["spreadsheetId"]
-
-        # 2. Move to the designated Drive folder
-        file = self.drive_service.files().get(
-            fileId=spreadsheet_id, fields="parents"
+        # 1. Add a new sheet tab
+        add_result = self.sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=TEMPLATE_SHEET_ID,
+            body={
+                "requests": [
+                    {
+                        "addSheet": {
+                            "properties": {
+                                "title": tab_name,
+                                "index": 0,  # Insert at the front
+                            }
+                        }
+                    }
+                ]
+            },
         ).execute()
-        previous_parents = ",".join(file.get("parents", []))
-        self.drive_service.files().update(
-            fileId=spreadsheet_id,
-            addParents=self.folder_id,
-            removeParents=previous_parents,
-            fields="id, parents",
-        ).execute()
+        new_sheet_id = add_result["replies"][0]["addSheet"]["properties"]["sheetId"]
 
-        # 3. Set public read access
-        self.drive_service.permissions().create(
-            fileId=spreadsheet_id,
-            body={"type": "anyone", "role": "reader"},
-            fields="id",
-        ).execute()
-
-        # 4. Write header row + data
+        # 2. Write header row + data
         rows = [SHEET_HEADERS]
         for lead in leads:
             rows.append([
@@ -116,22 +109,28 @@ class GoogleSheetsClient:
             ])
 
         self.sheets_service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range="Qualified Leads!A1",
+            spreadsheetId=TEMPLATE_SHEET_ID,
+            range=f"'{tab_name}'!A1",
             valueInputOption="RAW",
             body={"values": rows},
         ).execute()
 
-        # 5. Format header row (bold + freeze)
+        # 3. Format header row (bold white text on dark background + freeze)
         requests = [
             {
                 "repeatCell": {
-                    "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 1},
+                    "range": {
+                        "sheetId": new_sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 1,
+                    },
                     "cell": {
                         "userEnteredFormat": {
-                            "textFormat": {"bold": True},
-                            "backgroundColor": {"red": 0.2, "green": 0.2, "blue": 0.3},
-                            "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
+                            "backgroundColor": {"red": 0.15, "green": 0.15, "blue": 0.25},
+                            "textFormat": {
+                                "bold": True,
+                                "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                            },
                         }
                     },
                     "fields": "userEnteredFormat(textFormat,backgroundColor)",
@@ -139,19 +138,54 @@ class GoogleSheetsClient:
             },
             {
                 "updateSheetProperties": {
-                    "properties": {"sheetId": 0, "gridProperties": {"frozenRowCount": 1}},
+                    "properties": {
+                        "sheetId": new_sheet_id,
+                        "gridProperties": {"frozenRowCount": 1},
+                    },
                     "fields": "gridProperties.frozenRowCount",
+                }
+            },
+            # Auto-resize columns to fit content
+            {
+                "autoResizeDimensions": {
+                    "dimensions": {
+                        "sheetId": new_sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 0,
+                        "endIndex": len(SHEET_HEADERS),
+                    }
                 }
             },
         ]
         self.sheets_service.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
+            spreadsheetId=TEMPLATE_SHEET_ID,
             body={"requests": requests},
         ).execute()
 
-        sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit?usp=sharing"
+        # 4. Ensure the spreadsheet is publicly readable
+        try:
+            self.drive_service.permissions().create(
+                fileId=TEMPLATE_SHEET_ID,
+                body={"type": "anyone", "role": "reader"},
+                fields="id",
+            ).execute()
+        except Exception:
+            # Permission might already exist — that's fine
+            pass
+
+        # URL with gid pointing directly to the new tab
+        sheet_url = (
+            f"https://docs.google.com/spreadsheets/d/{TEMPLATE_SHEET_ID}"
+            f"/edit#gid={new_sheet_id}"
+        )
 
         duration = round((time.perf_counter() - start) * 1000, 1)
-        logger.info("sheet_created", spreadsheet_id=spreadsheet_id, rows=len(leads), duration_ms=duration)
+        logger.info(
+            "sheet_created",
+            spreadsheet_id=TEMPLATE_SHEET_ID,
+            tab=tab_name,
+            rows=len(leads),
+            duration_ms=duration,
+        )
 
         return sheet_url
