@@ -16,25 +16,15 @@ CANDIDATE COMPANIES (batch of up to 25):
 
 QUALIFICATION RULES:
 1. Score each candidate 0–100 on relevance to the target's ICP.
-2. Score HIGHER for:
-   - Companies founded in the last 3 years
-   - Recently funded (seed / Series A signals)
-   - Hiring marketing roles
-   - No in-house marketing team OR a marketing team of 1–2 people
-   - Unsophisticated current marketing (basic website, low LinkedIn presence)
-3. Score LOWER (or zero) for:
-   - Companies with >20 employees
-   - Established household-name brands
-   - Public companies or any with apparent revenue >$50M
-   - Companies with a large in-house marketing team
+2. Score HIGHER for candidates that perfectly match the "ideal_customer_size" and "industries_served".
+3. Score LOWER (or zero) for candidates that explicitly contradict the ICP or are completely irrelevant.
 
 For each candidate, output:
 {{
   "company_name": "...",
   "relevance_score": 0-100,
   "why_qualified": "1 sentence — what makes them a buyer",
-  "buying_intent_signals": ["signal 1", "signal 2"],
-  "exclude": false
+  "buying_intent_signals": ["signal 1", "signal 2"]
 }}
 
 Return a JSON array. No prose, no markdown fences."""

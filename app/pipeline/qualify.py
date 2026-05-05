@@ -169,12 +169,12 @@ class QualificationPipeline:
         """
         all_candidates: dict[str, CandidateCompany] = {}
 
-        # 1. Generate 3 seed domains based on the ICP
-        seed_prompt = f"""You need to provide 3 real, active US company domains that fit this ICP:
+        # 1. Generate 75 seed domains based on the ICP
+        seed_prompt = f"""You need to provide a massive list of 75 real, active US company domains that perfectly fit this ICP:
         Niche: {icp.niche}
         Industries: {', '.join(icp.industries_served) if icp.industries_served else 'Any business that needs this service'}
         Output ONLY a JSON array of strings (the domains like "example.com"). No prose.
-        Do NOT output the target company's domain or competitors of the target company. Output companies that would BUY from them."""
+        Provide a highly diverse mix of domains."""
         
         try:
             raw_seeds = await self.ai.call_claude(seed_prompt, temperature=0.7)
@@ -184,32 +184,17 @@ class QualificationPipeline:
         except Exception:
             seed_domains = ["nike.com", "salesforce.com"]
 
-        # 2. Get competitors for those seed domains (first degree)
-        tasks = [self._get_competitors_of(domain) for domain in seed_domains[:3]]
-        first_degree = []
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in results:
-                if isinstance(res, list):
-                    first_degree.extend(res)
-
-        # Add first degree to candidates
-        for c in first_degree:
-            key = (c.domain or c.company_name).lower()
-            if key not in all_candidates and c.company_name.lower() != company_name.lower():
-                all_candidates[key] = c
-
-        # 3. Get competitors of the first degree (second degree) to expand pool to ~100
-        expanded_domains = [c.domain for c in first_degree if c.domain][:10]
-        tasks2 = [self._get_competitors_of(domain) for domain in expanded_domains]
-        if tasks2:
-            results2 = await asyncio.gather(*tasks2, return_exceptions=True)
-            for res in results2:
-                if isinstance(res, list):
-                    for c in res:
-                        key = (c.domain or c.company_name).lower()
-                        if key not in all_candidates and c.company_name.lower() != company_name.lower():
-                            all_candidates[key] = c
+        # 2. Enrich the seeds directly
+        candidates = [CandidateCompany(company_name=domain.split('.')[0], domain=domain) for domain in seed_domains if isinstance(domain, str)]
+        
+        enrich_tasks = [self._enrich_candidate(c) for c in candidates[:75]]
+        if enrich_tasks:
+            enriched_results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
+            for res in enriched_results:
+                if isinstance(res, CandidateCompany):
+                    key = (res.domain or res.company_name).lower()
+                    if key not in all_candidates and res.company_name.lower() != company_name.lower():
+                        all_candidates[key] = res
 
         # Filter: US-based only
         filtered = []
@@ -348,9 +333,6 @@ class QualificationPipeline:
                     scored_data = [scored_data]
 
                 for item in scored_data:
-                    if item.get("exclude", False):
-                        continue
-
                     # Find the matching candidate for enrichment data
                     matched = self._find_candidate(batch, item.get("company_name", ""))
 
