@@ -91,17 +91,51 @@ class QualificationPipeline:
         logger.info("pipeline_step", step="5_exclusions")
         leads = self._apply_exclusions(scored)
         
-        # Sort by relevance and take top 50
+        # Sort by relevance and take top candidates
         leads.sort(key=lambda x: x.relevance_score, reverse=True)
-        final_leads = leads[:50]
+        top_leads = leads[:TARGET_LEADS]
+        
+        # ── Step 6: Contact Discovery ────────────────────────────
+        logger.info("pipeline_step", step="6_contact_discovery", count=len(top_leads))
+        final_leads = []
+        contact_tasks = [self._find_contact(lead) for lead in top_leads]
+        if contact_tasks:
+            results = await asyncio.gather(*contact_tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, QualifiedLead):
+                    final_leads.append(res)
+        
         logger.info("final_leads", count=len(final_leads))
 
         # ── Step 7: Write to Google Sheets ─────────────────────
         logger.info("pipeline_step", step="7_write_sheet")
         sheet_url = self.sheets.create_sheet(company_name, final_leads)
-        logger.info("sheet_created", url=sheet_url, count=len(final_leads))
-
+        
         return sheet_url, len(final_leads)
+
+    async def _find_contact(self, lead: QualifiedLead) -> QualifiedLead:
+        """Find decision maker (Owner/CEO/Marketing Director) at the company."""
+        if not lead.website:
+            return lead
+            
+        try:
+            # Try to find high-level roles
+            roles = ["CEO", "Owner", "Founder", "Marketing Director", "VP Marketing"]
+            for role in roles:
+                contact_res = await self.leadmagic.role_finder(company_domain=lead.website, role=role)
+                data = contact_res.get("data", [])
+                if data:
+                    person = data[0]
+                    lead.contact_name = f"{person.get('first_name', '')} {person.get('last_name', '')}".strip()
+                    lead.contact_title = person.get("title")
+                    lead.contact_email = person.get("email")
+                    lead.contact_phone = person.get("phone")
+                    if lead.contact_email:
+                        break # Found one!
+            return lead
+        except Exception as e:
+            logger.warning("contact_discovery_failed", company=lead.company, error=str(e))
+            return lead
 
     # ─── Step 1: ICP Extraction ────────────────────────────────
 
@@ -155,62 +189,46 @@ class QualificationPipeline:
         target_state: Optional[str],
     ) -> list[CandidateCompany]:
         """
-        Build candidate pool by using AI to generate 100 REAL company names
-        based on the ICP, niche, and past clients/case studies, then verifying them.
+        Build candidate pool using LeadMagic jobs_finder (discovery) based on the niche.
         """
         all_candidates: dict[str, CandidateCompany] = {}
 
-        # 1. Ask AI to generate 100 REAL company names matching the ICP/Niche/Past Clients
-        seed_prompt = f"""You need to provide a massive list of 100 REAL, active US company NAMES (not domains) that would be PERFECT leads for this agency.
-        Agency Niche: {icp.niche}
-        Services they provide: {', '.join(icp.services_provided)}
-        Examples of their past clients (or similar): {', '.join(icp.past_clients)}
-        
-        Output ONLY a JSON array of strings (the company names). No prose.
-        Ensure these are real, verifiable businesses, primarily SMBs with 10-50 employees."""
-        
+        # 1. Use LeadMagic jobs_finder to find real companies based on the agency's niche
+        # This replaces the AI-generated names with real-world hiring/business data.
         try:
-            raw_seeds = await self.ai.call_claude(seed_prompt, temperature=0.7)
-            seed_names = await self.ai.parse_json_response(raw_seeds)
-            if not isinstance(seed_names, list):
-                seed_names = []
-        except Exception:
-            seed_names = []
+            logger.info("discovery_search", niche=icp.niche)
+            discovery_results = await self.leadmagic.jobs_finder(job_description=icp.niche, limit=50)
+            
+            # The jobs-finder returns companies matching the description
+            # Let's extract domains/names from results
+            results = discovery_results.get("data", [])
+            seed_domains = []
+            for item in results:
+                domain = item.get("website") or item.get("company_domain")
+                if domain:
+                    seed_domains.append(domain)
+        except Exception as e:
+            logger.error("discovery_search_failed", error=str(e))
+            seed_domains = []
 
-        # 2. Verify each name via LeadMagic company_search(company_name=name)
-        # We do this concurrently.
-        enrich_tasks = [self.leadmagic.company_search(company_name=name) for name in seed_names[:100]]
+        # 2. Enrich the discovered domains via LeadMagic company_search
+        enrich_tasks = [self.leadmagic.company_search(company_domain=domain) for domain in seed_domains[:50]]
         if enrich_tasks:
             enriched_results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
             for res in enriched_results:
                 if isinstance(res, dict) and (res.get("domain") or res.get("website")):
-                    # Successfully found a real company
-                    candidate = self._parse_competitor(res) # Re-use the parser for basic fields
+                    candidate = self._parse_competitor(res)
                     if candidate:
-                        # Re-enrich manually to ensure we have all fields from company-search
-                        candidate.employee_count = res.get("employeeCount")
-                        candidate.industry = res.get("industry") or candidate.industry
-                        
-                        hq = res.get("headquarter") or {}
-                        candidate.state = normalize_state(hq.get("geographicArea"))
-                        candidate.country = hq.get("country")
-
+                        # Enforce < 50 employees immediately
+                        if candidate.employee_count is not None and candidate.employee_count >= 50:
+                            continue
+                            
                         key = (candidate.domain or candidate.company_name).lower()
                         if key not in all_candidates and candidate.company_name.lower() != company_name.lower():
                             all_candidates[key] = candidate
 
-        # Filter: US-based only, and < 50 employees
-        filtered = []
-        for c in all_candidates.values():
-            if c.country and c.country.upper() not in ("US", "USA", "UNITED STATES"):
-                continue
-            # Enforce < 50 employees
-            if c.employee_count is not None and c.employee_count >= 50:
-                continue
-            filtered.append(c)
-
-        logger.info("candidate_pool_built", seeds=len(seed_names), total=len(all_candidates), filtered=len(filtered))
-        return filtered
+        logger.info("candidate_pool_built", total=len(all_candidates))
+        return list(all_candidates.values())
 
     async def _get_competitors_of(self, domain: str) -> list[CandidateCompany]:
         """Get competitors of a company by domain."""

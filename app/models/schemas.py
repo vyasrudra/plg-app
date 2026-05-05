@@ -72,6 +72,12 @@ class QualifiedLead(BaseModel):
     why_qualified: str = ""
     buying_intent_signals: list[str] = []
     linkedin_url: Optional[str] = None
+    
+    # Contact Details
+    contact_name: Optional[str] = None
+    contact_title: Optional[str] = None
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
 
 
 class CandidateCompany(BaseModel):

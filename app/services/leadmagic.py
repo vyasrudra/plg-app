@@ -159,3 +159,25 @@ class LeadMagicClient:
             payload["company_name"] = company_name
 
         return await self._request("people/employee-finder", payload)
+
+    async def jobs_finder(self, job_description: str, limit: int = 50) -> dict:
+        """
+        Search for companies by niche/ICP keywords using job descriptions.
+        POST /v1/jobs/jobs-finder
+        """
+        payload = {
+            "job_description": job_description,
+            "limit": limit
+        }
+        return await self._request("jobs/jobs-finder", payload)
+
+    async def role_finder(self, company_domain: str, role: str) -> dict:
+        """
+        Find a specific role (e.g. CEO, Marketing Director) at a company.
+        POST /v1/people/role-finder
+        """
+        payload = {
+            "company_domain": company_domain,
+            "role": role
+        }
+        return await self._request("people/role-finder", payload)

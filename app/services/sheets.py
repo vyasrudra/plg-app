@@ -31,6 +31,10 @@ SHEET_HEADERS = [
     "Why Qualified",
     "Buying Intent Signals",
     "LinkedIn URL",
+    "Contact Name",
+    "Contact Title",
+    "Contact Email",
+    "Contact Phone"
 ]
 
 SCOPES = [
@@ -106,6 +110,10 @@ class GoogleSheetsClient:
                 lead.why_qualified,
                 ", ".join(lead.buying_intent_signals),
                 lead.linkedin_url or "",
+                lead.contact_name or "",
+                lead.contact_title or "",
+                lead.contact_email or "",
+                lead.contact_phone or "",
             ])
 
         self.sheets_service.spreadsheets().values().update(
