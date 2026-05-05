@@ -88,20 +88,18 @@ REPLY:
 Output exactly one word: positive, neutral, or negative."""
 
 
-# ─── 8.4 ICP Extraction (Gemini) ────────────────────────────────
+# ─── 8.4 ICP Extraction (Claude) ────────────────────────────────
 
-ICP_EXTRACTION_PROMPT = """Read the following website content (homepage + about page) and extract the agency's ideal customer profile.
+ICP_EXTRACTION_PROMPT = """Read the following website content (homepage + about page) and extract the agency's ideal customer profile and past clients.
 
 CONTENT:
 {scraped_text}
 
 Output strict JSON:
 {{
-  "niche": "1 sentence describing what they do and for whom",
-  "ideal_customer_size": "employee range",
-  "ideal_customer_stage": "company stage",
-  "geographic_focus": "city/state/region focus, or 'national'",
-  "industries_served": ["industry 1", "industry 2", "..."]
+  "services_provided": ["service 1", "service 2"],
+  "niche": "1 sentence describing exactly what they do and for whom",
+  "past_clients": ["client1.com", "client2.com"] (if you can find domains or names of case studies/clients. If none found, infer 3 example domains of perfect ideal clients they WOULD serve.)
 }}
 
-No prose, no markdown fences."""
+No prose, no markdown fences. Just the raw JSON object."""

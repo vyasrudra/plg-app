@@ -109,22 +109,16 @@ class QualificationPipeline:
     # ─── Step 1: ICP Extraction ────────────────────────────────
 
     async def _extract_icp(self, website: str) -> ICPProfile:
-        """Scrape website → Gemini → typed ICP object."""
+        """Step 1: Scrape website and extract ICP via Claude."""
         scraped_text = await self.scraper.scrape(website)
-
-        prompt = ICP_EXTRACTION_PROMPT.format(scraped_text=scraped_text)
-        raw = await self.ai.call_gemini(prompt, temperature=0.2)
-
-        try:
-            data = await self.ai.parse_json_response(raw)
-            return ICPProfile(**data)
-        except Exception as e:
-            logger.warning("icp_parse_retry", error=str(e))
-            # Retry with temperature=0 and strict JSON reminder
-            retry_prompt = prompt + "\n\nIMPORTANT: Return ONLY valid JSON. No prose, no markdown."
-            raw2 = await self.ai.call_gemini(retry_prompt, temperature=0.0)
-            data2 = await self.ai.parse_json_response(raw2)
-            return ICPProfile(**data2)
+        
+        prompt = ICP_EXTRACTION_PROMPT.format(scraped_text=scraped_text[:10000])
+        raw_json = await self.ai.call_claude(prompt, temperature=0)
+        
+        data = await self.ai.parse_json_response(raw_json)
+        logger.info("icp_extracted", niche=data.get("niche"), past_clients=data.get("past_clients"))
+        
+        return ICPProfile(**data)
 
     # ─── Step 2: Enrich Target Company ─────────────────────────
 
@@ -169,37 +163,55 @@ class QualificationPipeline:
         """
         all_candidates: dict[str, CandidateCompany] = {}
 
-        # 1. Generate 75 seed domains based on the ICP
-        seed_prompt = f"""You need to provide a massive list of 75 real, active US company domains that perfectly fit this ICP:
-        Niche: {icp.niche}
-        Industries: {', '.join(icp.industries_served) if icp.industries_served else 'Any business that needs this service'}
-        Output ONLY a JSON array of strings (the domains like "example.com"). No prose.
-        Provide a highly diverse mix of domains."""
-        
-        try:
-            raw_seeds = await self.ai.call_claude(seed_prompt, temperature=0.7)
-            seed_domains = await self.ai.parse_json_response(raw_seeds)
-            if not isinstance(seed_domains, list):
-                seed_domains = ["acme.com", "stripe.com"]
-        except Exception:
-            seed_domains = ["nike.com", "salesforce.com"]
+        # 1. Use past clients / case studies from ICP to find similar companies
+        seed_domains = icp.past_clients
+        if not seed_domains:
+            # Fallback if Claude couldn't extract any
+            seed_domains = ["ecommerce.com", "saas.com"]
+            
+        # Clean domains
+        seed_domains = [d for d in seed_domains if "." in d]
 
-        # 2. Enrich the seeds directly
-        candidates = [CandidateCompany(company_name=domain.split('.')[0], domain=domain) for domain in seed_domains if isinstance(domain, str)]
-        
-        enrich_tasks = [self._enrich_candidate(c) for c in candidates[:75]]
+        # 2. Get competitors for those seed domains to find companies like their clients
+        tasks = [self._get_competitors_of(domain) for domain in seed_domains[:10]]
+        first_degree = []
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, list):
+                    first_degree.extend(res)
+
+        # Expand pool by getting competitors of the first degree as well
+        expanded_domains = [c.domain for c in first_degree if c.domain][:15]
+        tasks2 = [self._get_competitors_of(domain) for domain in expanded_domains]
+        if tasks2:
+            results2 = await asyncio.gather(*tasks2, return_exceptions=True)
+            for res in results2:
+                if isinstance(res, list):
+                    first_degree.extend(res)
+
+        # Add to all candidates
+        for c in first_degree:
+            key = (c.domain or c.company_name).lower()
+            if key not in all_candidates and c.company_name.lower() != company_name.lower():
+                all_candidates[key] = c
+
+        # 3. Enrich candidates to get employee counts
+        enrich_tasks = [self._enrich_candidate(c) for c in all_candidates.values()]
         if enrich_tasks:
             enriched_results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
             for res in enriched_results:
                 if isinstance(res, CandidateCompany):
                     key = (res.domain or res.company_name).lower()
-                    if key not in all_candidates and res.company_name.lower() != company_name.lower():
-                        all_candidates[key] = res
+                    all_candidates[key] = res
 
-        # Filter: US-based only
+        # Filter: US-based only, and < 50 employees
         filtered = []
         for c in all_candidates.values():
             if c.country and c.country.upper() not in ("US", "USA", "UNITED STATES"):
+                continue
+            # Enforce < 50 employees as requested by user
+            if c.employee_count is not None and c.employee_count >= 50:
                 continue
             filtered.append(c)
 
@@ -307,7 +319,10 @@ class QualificationPipeline:
         candidates: list[CandidateCompany],
         icp: ICPProfile,
     ) -> list[QualifiedLead]:
-        """Score candidates in batches via Claude."""
+        """
+        Step 4: AI Qualification via Gemini
+        Batch candidate companies and ask Gemini to score them against the ICP.
+        """
         icp_json = icp.model_dump_json(indent=2)
         all_scored: list[QualifiedLead] = []
 
@@ -326,7 +341,7 @@ class QualificationPipeline:
             )
 
             try:
-                raw = await self.ai.call_claude(prompt, temperature=0.2)
+                raw = await self.ai.call_gemini(prompt, temperature=0.2)
                 scored_data = await self.ai.parse_json_response(raw)
 
                 if not isinstance(scored_data, list):
@@ -375,10 +390,11 @@ class QualificationPipeline:
     # ─── Step 5: Exclusions ────────────────────────────────────
 
     def _apply_exclusions(self, leads: list[QualifiedLead]) -> list[QualifiedLead]:
-        """Apply hard filters after scoring (PRD Section 6, Step 5)."""
+        """Apply hard filters after scoring to remove defaulters/poor matches."""
         filtered = []
         for lead in leads:
-            filtered.append(lead)
+            if lead.relevance_score >= 40:
+                filtered.append(lead)
 
         return filtered
 

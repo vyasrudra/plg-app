@@ -54,12 +54,10 @@ class StatusResponse(BaseModel):
 # ─── Internal Models ───────────────────────────────────────────
 
 class ICPProfile(BaseModel):
-    """Extracted ICP from target website via Gemini."""
-    niche: str
-    ideal_customer_size: str
-    ideal_customer_stage: str
-    geographic_focus: str
-    industries_served: list[str]
+    """Extracted ICP from target website via Claude."""
+    services_provided: list[str] = []
+    niche: str = ""
+    past_clients: list[str] = []
 
 
 class QualifiedLead(BaseModel):
