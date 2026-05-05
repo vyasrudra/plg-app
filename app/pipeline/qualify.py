@@ -60,7 +60,7 @@ class QualificationPipeline:
         # ── Step 1: Scrape website → extract ICP via Gemini ────
         logger.info("pipeline_step", step="1_icp_extraction", company=company_name)
         icp = await self._extract_icp(website)
-        logger.info("icp_extracted", niche=icp.niche, industries=icp.industries_served)
+        logger.info("icp_extracted", niche=icp.niche, past_clients=icp.past_clients)
 
         # ── Step 2: Get target company info via LeadMagic ──────
         logger.info("pipeline_step", step="2_target_enrichment", company=company_name)
