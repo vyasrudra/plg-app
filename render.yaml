@@ -1,0 +1,24 @@
+# Render deployment config — auto-deploy from GitHub main branch
+services:
+  - type: web
+    name: plg-app
+    runtime: python
+    region: oregon
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: PORT
+        value: "10000"
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: LEADMAGIC_API_KEY
+        sync: false
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: GOOGLE_DRIVE_FOLDER_ID
+        sync: false
+    healthCheckPath: /health
