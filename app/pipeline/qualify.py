@@ -155,52 +155,61 @@ class QualificationPipeline:
         target_state: Optional[str],
     ) -> list[CandidateCompany]:
         """
-        Build candidate pool by using AI to generate 100 targeted domains
-        based on the ICP, niche, and past clients/case studies.
+        Build candidate pool by using AI to generate 100 REAL company names
+        based on the ICP, niche, and past clients/case studies, then verifying them.
         """
         all_candidates: dict[str, CandidateCompany] = {}
 
-        # 1. Ask AI to generate 100 highly targeted domains matching the ICP/Niche/Past Clients
-        seed_prompt = f"""You need to provide a massive list of 100 real, active US company domains that would be PERFECT leads for this agency.
+        # 1. Ask AI to generate 100 REAL company names matching the ICP/Niche/Past Clients
+        seed_prompt = f"""You need to provide a massive list of 100 REAL, active US company NAMES (not domains) that would be PERFECT leads for this agency.
         Agency Niche: {icp.niche}
         Services they provide: {', '.join(icp.services_provided)}
         Examples of their past clients (or similar): {', '.join(icp.past_clients)}
         
-        Output ONLY a JSON array of strings (the domains like "example.com"). No prose.
-        Ensure these are SMBs (Small-to-Medium Businesses) and NOT massive corporations."""
+        Output ONLY a JSON array of strings (the company names). No prose.
+        Ensure these are real, verifiable businesses, primarily SMBs with 10-50 employees."""
         
         try:
             raw_seeds = await self.ai.call_claude(seed_prompt, temperature=0.7)
-            seed_domains = await self.ai.parse_json_response(raw_seeds)
-            if not isinstance(seed_domains, list):
-                seed_domains = []
+            seed_names = await self.ai.parse_json_response(raw_seeds)
+            if not isinstance(seed_names, list):
+                seed_names = []
         except Exception:
-            seed_domains = []
+            seed_names = []
 
-        # 2. Enrich the seeds directly via LeadMagic company_search
-        candidates = [CandidateCompany(company_name=domain.split('.')[0], domain=domain) for domain in seed_domains if isinstance(domain, str)]
-        
-        # Process in batches to avoid overwhelming the concurrent limits
-        enrich_tasks = [self._enrich_candidate(c) for c in candidates[:100]]
+        # 2. Verify each name via LeadMagic company_search(company_name=name)
+        # We do this concurrently.
+        enrich_tasks = [self.leadmagic.company_search(company_name=name) for name in seed_names[:100]]
         if enrich_tasks:
             enriched_results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
             for res in enriched_results:
-                if isinstance(res, CandidateCompany):
-                    key = (res.domain or res.company_name).lower()
-                    if key not in all_candidates and res.company_name.lower() != company_name.lower():
-                        all_candidates[key] = res
+                if isinstance(res, dict) and (res.get("domain") or res.get("website")):
+                    # Successfully found a real company
+                    candidate = self._parse_competitor(res) # Re-use the parser for basic fields
+                    if candidate:
+                        # Re-enrich manually to ensure we have all fields from company-search
+                        candidate.employee_count = res.get("employeeCount")
+                        candidate.industry = res.get("industry") or candidate.industry
+                        
+                        hq = res.get("headquarter") or {}
+                        candidate.state = normalize_state(hq.get("geographicArea"))
+                        candidate.country = hq.get("country")
+
+                        key = (candidate.domain or candidate.company_name).lower()
+                        if key not in all_candidates and candidate.company_name.lower() != company_name.lower():
+                            all_candidates[key] = candidate
 
         # Filter: US-based only, and < 50 employees
         filtered = []
         for c in all_candidates.values():
             if c.country and c.country.upper() not in ("US", "USA", "UNITED STATES"):
                 continue
-            # Enforce < 50 employees as requested by user
+            # Enforce < 50 employees
             if c.employee_count is not None and c.employee_count >= 50:
                 continue
             filtered.append(c)
 
-        logger.info("candidate_pool_built", seeds=len(seed_domains), total=len(all_candidates), filtered=len(filtered))
+        logger.info("candidate_pool_built", seeds=len(seed_names), total=len(all_candidates), filtered=len(filtered))
         return filtered
 
     async def _get_competitors_of(self, domain: str) -> list[CandidateCompany]:
